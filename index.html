@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Jiggler</title>
+<style>
+  :root { --bg:#111418; --card:#1b2027; --text:#e8eaed; --muted:#8a939e; --on:#2ecc71; --off:#e74c3c; --accent:#4c8dff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui, sans-serif;
+         min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px; gap:20px; }
+  h1 { font-size:20px; margin:0; font-weight:600; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--muted); margin-right:6px; }
+  .dot.live { background:var(--on); box-shadow:0 0 8px var(--on); }
+  #via { font-size:13px; color:var(--muted); margin-top:-12px; }
+  #toggle { width:220px; height:220px; border-radius:50%; border:none; font-size:26px; font-weight:700; color:#fff;
+            background:var(--off); box-shadow:0 10px 30px rgba(0,0,0,.4); transition:background .2s, transform .1s; }
+  #toggle.on { background:var(--on); }
+  #toggle:active { transform:scale(.96); }
+  #toggle:disabled { background:#2a3038; color:var(--muted); }
+  .card { width:100%; max-width:420px; background:var(--card); border-radius:16px; padding:16px; }
+  .row { display:flex; justify-content:space-between; padding:6px 0; }
+  .muted { color:var(--muted); }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .chip { flex:1; padding:10px 0; border-radius:10px; border:1px solid #333a44; background:transparent; color:var(--text); font-size:15px; }
+  .chip.sel { background:var(--accent); border-color:var(--accent); }
+  input[type=range] { width:100%; margin-top:12px; accent-color:var(--accent); }
+  #bt { width:100%; max-width:420px; padding:14px; border-radius:12px; border:1px solid var(--accent);
+        background:transparent; color:var(--accent); font-size:16px; font-weight:600; }
+  #bt.primary { background:var(--accent); color:#fff; }
+  #err { color:var(--off); text-align:center; max-width:420px; }
+</style>
+</head>
+<body>
+  <h1><span id="conn" class="dot"></span>Mouse Jiggler</h1>
+  <div id="via">не подключено</div>
+
+  <button id="toggle" disabled>СТАРТ</button>
+
+  <button id="bt" hidden>Подключиться по Bluetooth</button>
+
+  <div class="card">
+    <div class="row"><span class="muted">Статус</span><span id="status">—</span></div>
+    <div class="row"><span class="muted">Движений</span><span id="moves">0</span></div>
+    <div class="row"><span class="muted">Работает</span><span id="uptime">—</span></div>
+    <div class="row"><span class="muted">Последняя точка</span><span id="last">—</span></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><span>Интервал</span><b id="ivLabel">3 с</b></div>
+    <div class="chips" id="chips"></div>
+    <input type="range" id="iv" min="1" max="120" step="1" value="3">
+  </div>
+
+  <div id="err"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const presets = [3, 10, 30, 60];
+  let state = null;
+  let transport = null; // 'wifi' | 'ble'
+
+  $('chips').innerHTML = presets.map(s => `<button class="chip" data-s="${s}">${s} с</button>`).join('');
+
+  function showError(msg) { $('err').textContent = msg || ''; }
+  function setLive(on, label) {
+    $('conn').classList.toggle('live', on);
+    $('via').textContent = label;
+    $('toggle').disabled = !on;
+  }
+
+  // ================= Wi‑Fi (HTTP + SSE) =================
+  // Токен берём из ссылки и запоминаем, чтобы ярлык на главном экране работал и без него
+  const q = new URLSearchParams(location.search).get('t');
+  let token = q;
+  try { if (q) localStorage.setItem('jt', q); else token = localStorage.getItem('jt'); } catch {}
+  // Wi‑Fi режим возможен, только если страницу отдал сам Мак (а не GitHub Pages)
+  const servedByMac = location.protocol === 'http:' && !!token;
+
+  const wifi = {
+    async send(cmd, arg) {
+      const path = cmd === 'interval' ? 'config' : cmd;
+      const r = await fetch('/api/' + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-token': token || '' },
+        body: cmd === 'interval' ? JSON.stringify({ interval: arg }) : undefined,
+      });
+      if (r.status === 401) throw new Error('Неверный токен — откройте ссылку/QR из терминала');
+      onState(await r.json());
+    },
+    connect() {
+      const es = new EventSource('/api/events?t=' + encodeURIComponent(token || ''));
+      es.onopen = () => { if (transport !== 'ble') { transport = 'wifi'; setLive(true, 'по Wi‑Fi'); showError(); } };
+      es.onmessage = (e) => { if (transport === 'wifi') onState(JSON.parse(e.data)); };
+      es.onerror = () => { if (transport === 'wifi') setLive(false, 'Wi‑Fi: нет связи с Маком'); };
+    },
+  };
+
+  // ================= Bluetooth LE (Web Bluetooth) =================
+  // UUID должны совпадать с ble.js на Маке
+  const SERVICE_UUID = 'a3c87500-8ed3-4bdf-8a39-a01bebede295';
+  const CONTROL_UUID = 'a3c87501-8ed3-4bdf-8a39-a01bebede295';
+  const STATE_UUID   = 'a3c87502-8ed3-4bdf-8a39-a01bebede295';
+  const AUTH_UUID    = 'a3c87503-8ed3-4bdf-8a39-a01bebede295';
+
+  const savedPin = {
+    get() { try { return localStorage.getItem('jpin'); } catch { return null; } },
+    set(v) { try { v ? localStorage.setItem('jpin', v) : localStorage.removeItem('jpin'); } catch {} },
+  };
+
+  const ble = {
+    device: null,
+    control: null,
+
+    decode(view) {
+      const uptime = view.getUint32(9, true);
+      return {
+        running: view.getUint8(0) === 1,
+        moves: view.getUint32(1, true),
+        interval: view.getUint32(5, true),
+        startedAt: view.getUint8(0) === 1 ? Date.now() - uptime * 1000 : null,
+        lastMove: null, // по Bluetooth не передаётся
+      };
+    },
+
+    // Отправляет PIN на Мак. interactive=false — при автопереподключении не спрашиваем пользователя
+    async login(svc, interactive) {
+      const authChar = await svc.getCharacteristic(AUTH_UUID);
+      let pin = savedPin.get();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (!pin) {
+          if (!interactive) throw new Error('нужен PIN');
+          pin = prompt(attempt ? 'Неверный PIN. Попробуйте ещё раз:' : 'PIN-код (показан в терминале на Маке):');
+          if (!pin) throw new Error('PIN не введён');
+          pin = pin.trim();
+        }
+        try {
+          await authChar.writeValueWithResponse(new TextEncoder().encode(pin));
+          savedPin.set(pin);
+          return;
+        } catch {
+          savedPin.set(null);
+          pin = null;
+          if (!interactive) throw new Error('PIN не подошёл');
+        }
+      }
+      throw new Error('Неверный PIN (после 5 ошибок Мак блокирует вход на минуту)');
+    },
+
+    async connect(interactive = true) {
+      if (!this.device) {
+        this.device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+        this.device.addEventListener('gattserverdisconnected', () => this.onDisconnect());
+      }
+      setLive(false, 'Bluetooth: подключаюсь…');
+      const server = await this.device.gatt.connect();
+      const svc = await server.getPrimaryService(SERVICE_UUID);
+      try {
+        await this.login(svc, interactive);
+      } catch (e) {
+        this.device.gatt.disconnect();
+        throw e;
+      }
+      this.control = await svc.getCharacteristic(CONTROL_UUID);
+      const st = await svc.getCharacteristic(STATE_UUID);
+      st.addEventListener('characteristicvaluechanged', (e) => onState(this.decode(e.target.value)));
+      await st.startNotifications();
+      onState(this.decode(await st.readValue()));
+      transport = 'ble';
+      setLive(true, `по Bluetooth (${this.device.name || 'Jiggler'})`);
+      $('bt').hidden = true;
+      showError();
+    },
+
+    async onDisconnect() {
+      if (transport !== 'ble') return;
+      transport = servedByMac ? 'wifi' : null;
+      setLive(false, 'Bluetooth: связь потеряна, переподключаюсь…');
+      // Пытаемся вернуть связь несколько раз, потом показываем кнопку
+      for (let i = 0; i < 5; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        try { await this.connect(false); return; } catch {}
+      }
+      setLive(false, 'Bluetooth: не подключено');
+      $('bt').hidden = false;
+    },
+
+    async send(cmd, arg) {
+      let bytes;
+      if (cmd === 'stop') bytes = new Uint8Array([0x00]);
+      else if (cmd === 'start') bytes = new Uint8Array([0x01]);
+      else {
+        bytes = new Uint8Array(5);
+        bytes[0] = 0x02;
+        new DataView(bytes.buffer).setUint32(1, arg, true);
+      }
+      await this.control.writeValueWithResponse(bytes);
+    },
+  };
+
+  // ================= UI =================
+
+  function fmt(ms) {
+    const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+    return (h ? h + 'ч ' : '') + (m ? m + 'м ' : '') + (s % 60) + 'с';
+  }
+
+  function onState(s) { state = s; render(); }
+
+  function render() {
+    if (!state) return;
+    const on = state.running;
+    $('toggle').textContent = on ? 'СТОП' : 'СТАРТ';
+    $('toggle').classList.toggle('on', on);
+    $('status').textContent = on ? 'Работает' : 'Остановлен';
+    $('moves').textContent = state.moves;
+    $('uptime').textContent = on && state.startedAt ? fmt(Date.now() - state.startedAt) : '—';
+    $('last').textContent = state.lastMove ? `${state.lastMove.x}, ${state.lastMove.y}` : '—';
+    const sec = Math.round(state.interval / 1000);
+    $('ivLabel').textContent = sec + ' с';
+    if (document.activeElement !== $('iv')) $('iv').value = sec;
+    document.querySelectorAll('.chip').forEach(c => c.classList.toggle('sel', +c.dataset.s === sec));
+  }
+
+  async function send(cmd, arg) {
+    const t = transport === 'ble' ? ble : transport === 'wifi' ? wifi : null;
+    if (!t) return showError('Нет подключения к Маку');
+    try { await t.send(cmd, arg); showError(); }
+    catch (e) { showError(e.message); }
+  }
+
+  $('toggle').onclick = () => { navigator.vibrate?.(30); send(state?.running ? 'stop' : 'start'); };
+  $('chips').onclick = (e) => { const s = e.target.dataset.s; if (s) send('interval', s * 1000); };
+  $('iv').oninput = () => { $('ivLabel').textContent = $('iv').value + ' с'; };
+  $('iv').onchange = () => send('interval', $('iv').value * 1000);
+
+  $('bt').onclick = async () => {
+    try { await ble.connect(); }
+    catch (e) {
+      if (e.name !== 'NotFoundError') showError('Bluetooth: ' + e.message); // NotFoundError — пользователь закрыл окно выбора
+      setLive(transport === 'wifi', transport === 'wifi' ? 'по Wi‑Fi' : 'не подключено');
+    }
+  };
+
+  // ================= Старт =================
+
+  if (navigator.bluetooth) {
+    $('bt').hidden = false;
+    if (!servedByMac) $('bt').classList.add('primary');
+  }
+  if (servedByMac) {
+    wifi.connect();
+  } else if (!navigator.bluetooth) {
+    showError(window.isSecureContext
+      ? 'Этот браузер не поддерживает Bluetooth. Откройте страницу в Chrome на Android.'
+      : 'Для Bluetooth страницу нужно открыть по HTTPS.');
+  }
+
+  setInterval(render, 1000); // тикает время работы
+</script>
+</body>
+</html>
