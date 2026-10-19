@@ -31,6 +31,17 @@
         background:transparent; color:var(--accent); font-size:16px; font-weight:600; }
   #bt.primary { background:var(--accent); color:#fff; }
   #err { color:var(--off); text-align:center; max-width:420px; }
+  .opt { display:flex; align-items:center; gap:12px; padding:10px 0; }
+  .opt + .opt { border-top:1px solid #262c34; }
+  .opt div { flex:1; }
+  .opt small { display:block; color:var(--muted); font-size:13px; }
+  .switch { appearance:none; width:48px; height:28px; border-radius:14px; background:#333a44; position:relative;
+            flex:none; transition:background .2s; margin:0; }
+  .switch::after { content:''; position:absolute; top:3px; left:3px; width:22px; height:22px; border-radius:50%;
+                   background:#fff; transition:transform .2s; }
+  .switch:checked { background:var(--accent); }
+  .switch:checked::after { transform:translateX(20px); }
+  #status.wait { color:#f5b942; }
 </style>
 </head>
 <body>
@@ -52,6 +63,17 @@
     <div class="row"><span>Интервал</span><b id="ivLabel">3 с</b></div>
     <div class="chips" id="chips"></div>
     <input type="range" id="iv" min="1" max="120" step="1" value="3">
+  </div>
+
+  <div class="card">
+    <label class="opt">
+      <div>Пауза, пока я за Маком<small>Не трогает мышь, пока вы ей пользуетесь</small></div>
+      <input type="checkbox" class="switch" id="smart" checked>
+    </label>
+    <label class="opt">
+      <div>Незаметный режим<small>Сдвиг на 1 пиксель вместо движения по экрану</small></div>
+      <input type="checkbox" class="switch" id="stealth">
+    </label>
   </div>
 
   <div id="err"></div>
@@ -81,11 +103,11 @@
 
   const wifi = {
     async send(cmd, arg) {
-      const path = cmd === 'interval' ? 'config' : cmd;
-      const r = await fetch('/api/' + path, {
+      const body = cmd === 'interval' ? { interval: arg } : cmd === 'options' ? arg : undefined;
+      const r = await fetch('/api/' + (body ? 'config' : cmd), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-token': token || '' },
-        body: cmd === 'interval' ? JSON.stringify({ interval: arg }) : undefined,
+        body: body ? JSON.stringify(body) : undefined,
       });
       if (r.status === 401) throw new Error('Неверный токен — откройте ссылку/QR из терминала');
       onState(await r.json());
@@ -116,12 +138,16 @@
 
     decode(view) {
       const uptime = view.getUint32(9, true);
+      const flags = view.byteLength > 13 ? view.getUint8(13) : 1; // старый сервер без режимов
       return {
         running: view.getUint8(0) === 1,
         moves: view.getUint32(1, true),
         interval: view.getUint32(5, true),
         startedAt: view.getUint8(0) === 1 ? Date.now() - uptime * 1000 : null,
         lastMove: null, // по Bluetooth не передаётся
+        smart: !!(flags & 1),
+        stealth: !!(flags & 2),
+        userActive: !!(flags & 4),
       };
     },
 
@@ -191,6 +217,7 @@
       let bytes;
       if (cmd === 'stop') bytes = new Uint8Array([0x00]);
       else if (cmd === 'start') bytes = new Uint8Array([0x01]);
+      else if (cmd === 'options') bytes = new Uint8Array([0x03, (arg.smart ? 1 : 0) | (arg.stealth ? 2 : 0)]);
       else {
         bytes = new Uint8Array(5);
         bytes[0] = 0x02;
@@ -214,7 +241,11 @@
     const on = state.running;
     $('toggle').textContent = on ? 'СТОП' : 'СТАРТ';
     $('toggle').classList.toggle('on', on);
-    $('status').textContent = on ? 'Работает' : 'Остановлен';
+    const waiting = on && state.userActive;
+    $('status').textContent = !on ? 'Остановлен' : waiting ? 'Ждёт: вы за Маком' : 'Работает';
+    $('status').classList.toggle('wait', waiting);
+    $('smart').checked = state.smart !== false;
+    $('stealth').checked = !!state.stealth;
     $('moves').textContent = state.moves;
     $('uptime').textContent = on && state.startedAt ? fmt(Date.now() - state.startedAt) : '—';
     $('last').textContent = state.lastMove ? `${state.lastMove.x}, ${state.lastMove.y}` : '—';
@@ -235,6 +266,8 @@
   $('chips').onclick = (e) => { const s = e.target.dataset.s; if (s) send('interval', s * 1000); };
   $('iv').oninput = () => { $('ivLabel').textContent = $('iv').value + ' с'; };
   $('iv').onchange = () => send('interval', $('iv').value * 1000);
+  $('smart').onchange = $('stealth').onchange = () =>
+    send('options', { smart: $('smart').checked, stealth: $('stealth').checked });
 
   $('bt').onclick = async () => {
     try { await ble.connect(); }
